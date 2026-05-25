@@ -1,6 +1,6 @@
 # Claude Code Hook-Based Completion & Progress Detection
 
-## Status: ✅ Production (cc_sdk.py v3.2, 2026-05-25)
+## Status: ✅ Production (cc_sdk.py v3.3, 2026-05-25)
 
 ## 架构
 
@@ -28,8 +28,8 @@ CC 需要注意
 | 文件 | 用途 |
 |------|------|
 | `~/.claude/settings.json` | Hooks 配置（NOT 插件系统） |
-| `~/.local/bin/hermes_hook.py` | Hook 脚本 |
-| `~/.local/bin/cc_sdk.py` | SDK bridge（监控状态文件） |
+| `~/.claude/plugins/hermes-hooks/hooks/hermes_hook.py` | Hook 脚本 |
+| `~/.hermes/scripts/cc_sdk.py` | SDK bridge（监控状态文件） |
 
 ## Hook 配置
 
@@ -38,17 +38,17 @@ CC 需要注意
 ```json
 {
   "hooks": {
-    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.local/bin/hermes_hook.py", "timeout": 10}]}],
-    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.local/bin/hermes_hook.py", "timeout": 5}]}],
-    "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.local/bin/hermes_hook.py", "timeout": 10}]}],
-    "SubagentStop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.local/bin/hermes_hook.py", "timeout": 10}]}]
+    "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/plugins/hermes-hooks/hooks/hermes_hook.py", "timeout": 10}]}],
+    "PostToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/plugins/hermes-hooks/hooks/hermes_hook.py", "timeout": 5}]}],
+    "Notification": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/plugins/hermes-hooks/hooks/hermes_hook.py", "timeout": 10}]}],
+    "SubagentStop": [{"matcher": "", "hooks": [{"type": "command", "command": "python3 ~/.claude/plugins/hermes-hooks/hooks/hermes_hook.py", "timeout": 10}]}]
   }
 }
 ```
 
 ## 状态文件
 
-位置：`/tmp/cc-bridge-status/`
+位置：`/tmp/hermes-cc-status/`
 
 | 文件模式 | 写入时机 | 用途 |
 |---------|---------|------|
@@ -109,6 +109,22 @@ python3 cc_sdk.py "task" --bare --no-hooks --json
 4. **进度文件在完成后保留**，供事后分析
 5. **PostToolUse 用独立文件**，不覆盖 Stop 信号
 6. **Hook 在 CLI 和 SDK 模式下都触发**
+
+## SDK 崩溃恢复 (v3.3+)
+
+SDK 抛出异常时（API 后端崩溃、连接中断等），cc_sdk.py 自动从 hook 状态文件恢复：
+
+**路径 1: 有 Stop 事件**（CC 完成了但 SDK 没收到结果）
+- 读取 `{session_id}.json` 获取 Stop 事件
+- 恢复 `last_message`、`session_id`、transcript 统计
+- 错误信息: `Recovered from hook after SDK crash (tools=N)`
+
+**路径 2: 有 PostToolUse 但没有 Stop**（CC 做了一部分工作后崩溃）
+- 扫描 `{session_id}-PostToolUse-*.json` 文件
+- 从 hook 数据重建 `tool_uses` 数组
+- 错误信息: `Partial recovery from hooks: N tool calls captured`
+
+**Session ID 发现:** SDK 崩溃前可能还没返回 session_id。恢复函数会扫描 `STATUS_DIR` 最新的 5 个文件来查找候选 session ID。
 
 ## 性能
 
