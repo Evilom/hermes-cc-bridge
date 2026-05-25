@@ -1,213 +1,182 @@
 # hermes-cc-bridge
 
-**Real-time progress tracking & hook-based completion detection for Claude Code SDK**
+**Real-time progress tracking & hook-based completion detection for Claude Code**
 
-> 给 Claude Code 装上进度条 —— 实时知道它在做什么、做完了没有
-
-[English](#english) | [中文](#中文)
+[English](README.md) | [中文](README_CN.md)
 
 ---
 
-## English
+## The Problem: Claude Code is Blind
 
-### The Problem
+When you delegate a task to Claude Code via the SDK, you're flying blind:
 
-Claude Code is powerful, but blind. When you fire off a task:
+**No progress feedback.** You send a task — "Refactor the auth module" — and then... nothing. Is CC reading files? Writing code? Running tests? Stuck in a loop? You don't know. You stare at a terminal that outputs nothing until it either succeeds or times out.
 
-- ❌ No progress feedback — is it working or stuck?
-- ❌ `timeout` as the only signal — guess 300s and hope
-- ❌ `max_turns` as progress proxy — meaningless metric
-- ❌ No way to know what tools CC is using in real-time
+**Timeout is your only signal.** So you guess: "This task probably takes 300 seconds." If CC finishes in 30s, you waste 270s waiting. If CC needs 310s, you kill it at 300s — right before it would have finished. Either way, you lose.
 
-### The Solution
+**`max_turns` is meaningless.** Setting `max_turns=10` doesn't mean "10% done at turn 1." CC might do 80% of the work in 3 turns and spend 7 more on verification. Or it might use all 10 turns and only get halfway. You can't tell.
 
-**hermes-cc-bridge** hooks into Claude Code's event system to give you:
+**Timeout ≠ failure.** This is the worst part. When CC times out, the files it already wrote are still on disk. The work is done — but you think it failed, so you retry from scratch, wasting time and tokens. We've seen tasks that were 100% complete at timeout, but the post-completion verification step got killed.
+
+**No session continuity.** You can't ask "what just happened?" after a run. No structured output of what tools were used, what files were touched, how long it took. Just a wall of text or a timeout error.
+
+### What This Looks Like in Practice
 
 ```
-CC uses a tool  →  you see: [45s] tool #12: Edit | breakdown: {Read:5, Edit:6, Bash:1}
-CC finishes     →  you get: instant Stop signal (not timeout guess)
-CC needs input  →  you know: Notification event with reason
+# The old way: guess, wait, hope
+$ python3 cc_sdk.py "Big refactor" --max-turns 15 --timeout 600 --json
+
+# ... 10 minutes of silence ...
+
+# Either:
+#   ✅ {"success": true, ...}  (but you waited 10 min for a 2-min task)
+#   ❌ {"errors": ["TIMEOUT after 600s"]}  (but the work was actually done)
+#   ❌ {"errors": ["Reached max turns"]}  (but 80% was completed)
 ```
 
-### Features
+You have no idea which outcome you'll get. And when it fails, you don't know how far CC got before it stopped.
 
-| Feature | Description |
+---
+
+## The Solution: hermes-cc-bridge
+
+**hermes-cc-bridge** hooks into Claude Code's event system to give you real-time visibility into what CC is doing.
+
+### Before vs After
+
+| | Before (raw SDK) | After (with hermes-cc-bridge) |
+|---|---|---|
+| **Progress** | None. Wait for timeout or success. | Real-time. See every tool call as it happens. |
+| **Completion signal** | Timeout or SDK stream end | Stop hook fires instantly when CC finishes |
+| **"Is it stuck?"** | Can't tell. Wait and guess. | Check `--progress` — see live tool count & breakdown |
+| **Timeout failure** | Assume task failed. Retry from scratch. | Check files on disk. Resume with `--resume` if needed. |
+| **What CC did** | Wall of text output | Structured JSON: tools used, files touched, elapsed time |
+| **Session continuity** | Lost after timeout | `session_id` preserved, resume from last checkpoint |
+
+### What You See Now
+
+```
+$ python3 cc_sdk.py "Big refactor" --max-turns 15 --timeout 600 --json &
+
+# Check progress from another terminal:
+$ python3 cc_sdk.py --progress <session_id>
+
+# Output:
+[CC Progress] 12s | tool #3: Read | breakdown: {Read: 3}
+[CC Progress] 28s | tool #6: Edit | breakdown: {Read: 4, Edit: 2}
+[CC Progress] 45s | tool #12: Bash | breakdown: {Read: 5, Edit: 6, Bash: 1}
+
+# When done:
+[CC Progress] ✅ Done! 67s | turns=8 | tools=14 | used: Read, Edit, Bash
+```
+
+No more guessing. You know exactly what CC is doing, how long it's been working, and when it's done.
+
+---
+
+## Features
+
+| Feature | What it does |
 |---------|-------------|
-| 🔴 **Real-time Progress** | See every tool call as it happens — Read, Edit, Bash, Write... |
-| ✅ **Instant Completion** | Stop hook fires the moment CC finishes — no timeout guessing |
-| 📊 **Tool Breakdown** | Structured stats: which tools, how many, what files |
-| 🔄 **Session Resume** | Get `session_id` from any run, resume from where CC left off |
-| 📁 **Atomic Progress Files** | Written to disk safely, persist after completion |
-| 🐍 **Python API** | `await run_task(prompt, cwd, max_turns)` — async streaming |
-| ⚡ **CLI & SDK** | Works with both `claude -p` and `claude-code-sdk` |
+| 🔴 **Real-time Progress** | Every tool call (Read/Edit/Bash/Write...) tracked and reported |
+| ✅ **Instant Completion** | Stop hook fires the moment CC finishes — zero delay |
+| 📊 **Tool Breakdown** | `{Read: 5, Edit: 6, Bash: 1}` — structured, queryable |
+| 🔄 **Session Resume** | Get `session_id`, resume from where CC left off after timeout |
+| 📁 **Atomic Files** | Progress written to disk safely, persists after completion |
+| 🐍 **Python API** | `await run_task(prompt, cwd, max_turns)` — async, streaming |
+| ⚡ **Dual Mode** | Works with both `claude -p` (CLI) and `claude-code-sdk` (Python) |
 
-### Architecture
+---
+
+## Architecture
 
 ```
-┌─────────────────┐         hook events          ┌───────────────────┐
-│  Claude Code    │ ────────────────────────────→ │  hermes_hook.py   │
-│  (SDK or CLI)   │   PostToolUse / Stop / etc.   │  writes JSON to   │
-└─────────────────┘                               │  /tmp/cc-bridge/  │
-         │                                        └───────────────────┘
-         │ SDK stream                                         │
-         ▼                                                    ▼
-┌─────────────────┐                               ┌───────────────────┐
-│   cc_sdk.py     │ ←──────────────────────────── │  status files +   │
-│   reads hooks   │      polls every 0.5s         │  progress file    │
-│   + SDK stream  │                               └───────────────────┘
+┌─────────────────┐          hook events           ┌───────────────────┐
+│  Claude Code    │ ──────────────────────────────→ │  hermes_hook.py   │
+│  (SDK or CLI)   │   PostToolUse / Stop / Notify   │  writes JSON to   │
+└─────────────────┘                                 │  /tmp/cc-bridge/  │
+         │                                          └───────────────────┘
+         │ SDK stream                                           │
+         ▼                                                      ▼
+┌─────────────────┐                                 ┌───────────────────┐
+│   cc_sdk.py     │ ←────────────────────────────── │  status files +   │
+│   reads hooks   │         polls every 0.5s        │  progress file    │
+│   + SDK stream  │                                 └───────────────────┘
 └─────────────────┘
          │
          ▼
-   JSON result:
-   {
-     "success": true,
-     "text": "Done! Modified 3 files...",
-     "tool_count": 12,
-     "session_id": "ea836798-...",
-     "progress": {
-       "elapsed": 45.2,
-       "completed": true,
-       "tool_breakdown": {"Read": 5, "Edit": 6, "Bash": 1}
-     }
-   }
+   JSON result with:
+   • text output
+   • tool_uses array
+   • progress report (tool breakdown, elapsed, completed)
+   • session_id (for resume)
 ```
 
-### Quick Start
+**How it works:**
+
+1. CC fires a `PostToolUse` hook every time it uses a tool → `hermes_hook.py` writes a JSON status file
+2. `hermes_hook.py` also updates a unified `progress.json` on each tool call
+3. CC fires a `Stop` hook when it finishes → `hermes_hook.py` writes the completion file with full stats
+4. `cc_sdk.py` polls these files every 0.5s, builds structured progress reports
+5. You query progress with `--progress <session_id>` or get it in the JSON result
+
+---
+
+## Quick Start
 
 ```bash
-# 1. Install
+# 1. Install dependencies
 pip3 install claude-code-sdk
 npm install -g @anthropic-ai/claude-code
 
-# 2. Clone & setup
+# 2. Clone & deploy scripts
 git clone https://github.com/Evilom/hermes-cc-bridge.git
 cd hermes-cc-bridge
 cp scripts/cc_sdk.py scripts/hermes_hook.py ~/.local/bin/
 
 # 3. Configure hooks (add to ~/.claude/settings.json)
-#    See examples/settings.json for the full config
+#    See examples/settings.json for the template
 
-# 4. Run
+# 4. Run a task
 python3 ~/.local/bin/cc_sdk.py "Fix the auth bug" \
   --cwd /your/project --max-turns 8 --timeout 180 --json
 
-# 5. Check progress (from another terminal)
+# 5. Query progress (from another terminal)
 python3 ~/.local/bin/cc_sdk.py --progress <session_id>
 ```
 
----
-
-## 中文
-
-### 解决什么问题
-
-Claude Code 很强，但是"盲"的。发一个任务出去：
-
-- ❌ **没有进度反馈** —— 它在干活还是卡住了？
-- ❌ **靠 timeout 猜** —— 设 300 秒，到了就杀，可能刚好写完最后一步
-- ❌ **max_turns 不是进度** —— 10 轮不代表 10% 完成
-- ❌ **不知道在用什么工具** —— 是在读文件还是在跑命令？
-
-### 怎么解决
-
-**hermes-cc-bridge** 利用 Claude Code 的 Hook 事件系统，实现真正的进度追踪：
-
-```
-CC 调用工具  → 你看到: [45s] tool #12: Edit | 分布: {Read:5, Edit:6, Bash:1}
-CC 完成任务  → 你收到: 立即 Stop 信号（不用等 timeout）
-CC 等待输入  → 你知道: Notification 事件 + 原因
-```
-
-### 核心功能
-
-| 功能 | 说明 |
-|------|------|
-| 🔴 **实时进度** | 每个工具调用实时可见 —— Read、Edit、Bash、Write... |
-| ✅ **即时完成** | Stop hook 在 CC 完成的瞬间触发，不靠 timeout 猜 |
-| 📊 **工具统计** | 结构化数据：用了哪些工具、各多少次、改了什么文件 |
-| 🔄 **会话恢复** | 任何运行都返回 `session_id`，超时后 resume 继续 |
-| 📁 **原子写入** | 进度文件安全写入磁盘，完成后保留供事后分析 |
-| 🐍 **Python API** | `await run_task(prompt, cwd, max_turns)` —— 异步流式 |
-| ⚡ **CLI + SDK** | `claude -p` 和 `claude-code-sdk` 都能用 |
-
-### 进度文件长什么样
-
-```json
-{
-  "session_id": "ea836798-...",
-  "elapsed": 45.2,
-  "completed": false,
-  "total_tool_calls": 12,
-  "tool_breakdown": {"Read": 5, "Edit": 6, "Bash": 1},
-  "last_tool": {"tool": "Edit", "input": "{'file_path': 'src/auth.py'}"},
-  "updated_at": "2026-05-25 10:35:00"
-}
-```
-
-完成后 `completed: true`，`stop_stats` 填充完整统计：
-
-```json
-{
-  "total_turns": 93,
-  "total_tool_calls": 45,
-  "tools_used": ["Read", "Glob", "Edit", "Bash"],
-  "files_modified": ["src/App.tsx", "src/auth.py"]
-}
-```
-
-### 快速开始
+### Use Case 1: Don't Wait Blindly
 
 ```bash
-# 1. 安装依赖
-pip3 install claude-code-sdk
-npm install -g @anthropic-ai/claude-code
+# Fire and forget
+python3 cc_sdk.py "Refactor auth module" --max-turns 15 --timeout 600 --json &
 
-# 2. 克隆 & 部署
-git clone https://github.com/Evilom/hermes-cc-bridge.git
-cd hermes-cc-bridge
-cp scripts/cc_sdk.py scripts/hermes_hook.py ~/.local/bin/
-
-# 3. 配置 hooks（加到 ~/.claude/settings.json）
-#    参考 examples/settings.json
-
-# 4. 运行任务
-python3 ~/.local/bin/cc_sdk.py "修复 auth 模块的 bug" \
-  --cwd /your/project --max-turns 8 --timeout 180 --json
-
-# 5. 查询进度（另一个终端）
-python3 ~/.local/bin/cc_sdk.py --progress <session_id>
-```
-
-### 使用场景
-
-**场景 1：大任务不瞎等**
-```bash
-# 发任务
-python3 cc_sdk.py "重构整个认证模块" --max-turns 15 --timeout 600 --json &
-
-# 每隔几秒看一眼进度
+# Check progress anytime
 python3 cc_sdk.py --progress <session_id>
-# → {"total_tool_calls": 8, "tool_breakdown": {"Read": 3, "Edit": 4, "Bash": 1}, "elapsed": 32.1}
+# → {"total_tool_calls": 8, "tool_breakdown": {"Read":3, "Edit":4, "Bash":1}, "elapsed": 32.1}
 ```
 
-**场景 2：超时不丢工作**
+### Use Case 2: Don't Lose Work on Timeout
+
 ```bash
-# 第一次跑，超时了
-RESULT=$(python3 cc_sdk.py "复杂任务" --max-turns 10 --json)
+# First run — times out
+RESULT=$(python3 cc_sdk.py "Complex task" --max-turns 10 --json)
 SESSION_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['session_id'])")
 
-# 继续，不重头来
-python3 cc_sdk.py "继续之前的工作" --resume "$SESSION_ID" --max-turns 5 --json
+# Before: retry from scratch (wasting all previous work)
+# After: resume from where CC left off
+python3 cc_sdk.py "Continue" --resume "$SESSION_ID" --max-turns 5 --json
 ```
 
-**场景 3：Python 集成**
+### Use Case 3: Python Integration
+
 ```python
 import asyncio
 from cc_sdk import run_task
 
 async def deploy_check():
     result = await run_task(
-        prompt="Run all tests and fix any failures",
+        prompt="Run all tests and fix failures",
         cwd="/app",
         max_turns=12,
         timeout=300,
@@ -226,31 +195,38 @@ asyncio.run(deploy_check())
 
 ## CLI Reference
 
-| Flag | Default | Description / 说明 |
-|------|---------|-------------------|
-| `--cwd` | `.` | Working directory / 工作目录 |
-| `--max-turns` | 5 | Max agentic turns / 最大轮次 |
-| `--timeout` | 180 | Timeout seconds / 超时秒数 |
-| `--tools` | all | Allowed tools (comma) / 允许的工具 |
-| `--effort` | medium | low/medium/high/max / 推理深度 |
-| `--json` | off | JSON output / JSON 输出 |
-| `--quiet` | off | No stderr streaming / 静默模式 |
-| `--resume` | none | Resume session / 恢复会话 |
-| `--continue` | off | Continue latest / 继续最近会话 |
-| `--progress` | none | Query live progress / 查询实时进度 |
-| `--model` | none | Model override / 模型覆盖 |
-| `--bare` | off | ⚠️ Faster but disables hooks / 快但禁用 hooks |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cwd` | `.` | Working directory |
+| `--max-turns` | 5 | Max agentic turns |
+| `--timeout` | 180 | Timeout in seconds |
+| `--tools` | all | Allowed tools (comma-separated) |
+| `--effort` | medium | low / medium / high / max |
+| `--json` | off | JSON output |
+| `--quiet` | off | No streaming to stderr |
+| `--resume` | none | Resume a session by ID |
+| `--continue` | off | Continue most recent session |
+| `--progress` | none | Query live progress (read-only) |
+| `--model` | none | Model override |
+| `--bare` | off | ⚠️ Faster startup but disables hooks |
 
 ## Status Files
 
-Location: `/tmp/cc-bridge-status/` (config via `CC_BRIDGE_STATUS_DIR`)
+Location: `/tmp/cc-bridge-status/` (configurable via `CC_BRIDGE_STATUS_DIR` env var)
 
-| Pattern | When / 触发 | Purpose / 用途 |
-|---------|-------------|---------------|
-| `{id}.json` | Stop | Completion signal / 完成信号 |
-| `{id}-PostToolUse-{ts}.json` | Each tool | Tool record / 工具记录 |
-| `{id}-progress.json` | Each PostToolUse | Unified snapshot / 统一进度快照 |
-| `{id}-Notification-{ts}.json` | Needs attention | Input prompt / 等待输入 |
+| Pattern | When | Purpose |
+|---------|------|---------|
+| `{id}.json` | Stop | Completion signal with full stats |
+| `{id}-PostToolUse-{ts}.json` | Each tool call | Individual tool record |
+| `{id}-progress.json` | Each PostToolUse | Unified progress snapshot |
+| `{id}-Notification-{ts}.json` | CC needs attention | Permission / input prompt |
+
+## Key Design Decisions
+
+1. **Stop event = completion signal.** Not timeout. Not max_turns. The hook fires the instant CC finishes.
+2. **Progress files are atomic.** Write to `.tmp`, then rename. No partial reads.
+3. **Progress persists after completion.** Post-mortem analysis without re-running.
+4. **PostToolUse and Stop use separate files.** Progress events can't clobber the completion signal.
 
 ## Requirements
 
